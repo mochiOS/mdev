@@ -123,9 +123,13 @@ def run_vm(root, name):
         check(not runtime.is_symlink(), 'runtime directory must not be a symlink')
         disk = runtime / 'disk.img'
         fingerprint = runtime / 'image.sha256'
-        # This is VM state, not an SDK or source revision pin.
-        with source.open('rb') as stream:
-            image_hash = hashlib.file_digest(stream, 'sha256').hexdigest()
+        # Fresh development boots avoid reading a multi-GB image twice just to
+        # prepare a reflink. Persistent disks need the stronger content identity.
+        source_state = source.stat()
+        image_hash = None
+        if value['persistent']:
+            with source.open('rb') as stream:
+                image_hash = hashlib.file_digest(stream, 'sha256').hexdigest()
         if value['persistent'] and disk.exists():
             check(fingerprint.is_file() and fingerprint.read_text().strip() == image_hash,
                   'base image changed; persistent disk retained. Create a new VM to use the new image')
@@ -135,11 +139,17 @@ def run_vm(root, name):
             try:
                 # Independent writable copy; reflinks preserve fast local preparation.
                 subprocess.run(['cp', '--reflink=auto', '--sparse=always', '--', str(source), temporary], check=True)
-                with open(temporary, 'rb') as stream:
-                    check(hashlib.file_digest(stream, 'sha256').hexdigest() == image_hash,
-                          'source image changed while preparing VM; retry after the build finishes')
+                after_copy = source.stat()
+                check((source_state.st_dev, source_state.st_ino, source_state.st_size, source_state.st_mtime_ns)
+                      == (after_copy.st_dev, after_copy.st_ino, after_copy.st_size, after_copy.st_mtime_ns),
+                      'source image changed while preparing VM; retry after the build finishes')
+                if image_hash is not None:
+                    with open(temporary, 'rb') as stream:
+                        check(hashlib.file_digest(stream, 'sha256').hexdigest() == image_hash,
+                              'source image changed while preparing VM; retry after the build finishes')
                 os.replace(temporary, disk)
-                fingerprint.write_text(image_hash + '\n')
+                if image_hash is not None:
+                    fingerprint.write_text(image_hash + '\n')
             finally:
                 Path(temporary).unlink(missing_ok=True)
         env = os.environ.copy()

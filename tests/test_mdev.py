@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 ENTRY = Path(__file__).resolve().parents[1] / 'mdev'
 loader = importlib.machinery.SourceFileLoader('mdev', str(ENTRY))
@@ -49,7 +50,8 @@ Path(os.environ['MDEV_RUNTIME_DIR'], 'firmware').touch()
 
     def test_fresh_private_disk_each_boot(self):
         self.create()
-        self.assertEqual(mdev.run_vm(self.store, 'test'), 0)
+        with patch.object(mdev.hashlib, 'file_digest', side_effect=AssertionError('unnecessary full image read')):
+            self.assertEqual(mdev.run_vm(self.store, 'test'), 0)
         self.assertEqual(self.image.read_bytes(), b'base image')
         self.assertEqual(mdev.run_vm(self.store, 'test'), 0)
         self.assertTrue((self.store / 'test/runtime/firmware').exists())
