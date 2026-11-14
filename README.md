@@ -7,7 +7,7 @@ feature-specific guest tests.
 ## Everyday use
 
 ```sh
-mdev create default --image out/artifacts/disk.img --runner scripts/runner.sh
+mdev create default --image out/images/system/disk.img --runner scripts/runner.sh
 mdev list
 mdev doctor default
 mdev run default                  # Foreground, console also recorded
