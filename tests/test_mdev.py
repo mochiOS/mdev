@@ -20,7 +20,7 @@ mdev = importlib.util.module_from_spec(spec)
 loader.exec_module(mdev)
 
 
-class VMTests(unittest.TestCase):
+class VMFixture(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -42,6 +42,8 @@ Path(os.environ['MDEV_RUNTIME_DIR'], 'firmware').touch()
     def create(self, persistent=False):
         mdev.create(self.store, 'test', self.image, self.runner, persistent)
 
+
+class VMTests(VMFixture):
     def test_empty_list(self):
         with contextlib.redirect_stdout(io.StringIO()) as out:
             mdev.list_vms(self.store)
