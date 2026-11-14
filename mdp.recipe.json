@@ -1,0 +1,28 @@
+{
+  "format": 1,
+  "steps": [],
+  "package": {
+    "name": "mdev",
+    "version": "0.2.0",
+    "target": "x86_64-mochios",
+    "abi": "mochios-1"
+  },
+  "artifact": "out/mdp/mdev.tar.mdp",
+  "exports": [
+    {
+      "source": "mdev",
+      "area": "development-host",
+      "destination": "mdev/mdev"
+    },
+    {
+      "source": "control.py",
+      "area": "development-host",
+      "destination": "mdev/control.py"
+    },
+    {
+      "source": "supervisor.py",
+      "area": "development-host",
+      "destination": "mdev/supervisor.py"
+    }
+  ]
+}
