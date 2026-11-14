@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""Manage named local VM environments; builds and SDKs belong to other tools."""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+
+
+class Error(Exception):
+    """A VM configuration or lifecycle error suitable for display."""
+
+
+def check(condition, message):
+    """Reject an invalid lifecycle operation before modifying VM state."""
+    if not condition:
+        raise Error(message)
+
+
+def vm_path(root, name):
+    """Return a named VM's directory, rejecting paths and hidden names."""
+    check(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*', name), 'invalid VM name')
+    path = root / name
+    check(not path.is_symlink(), 'VM directories must not be symlinks')
+    return path
+
+
+def save(path, data):
+    """Atomically save a local VM descriptor."""
+    with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, delete=False) as stream:
+        temporary = Path(stream.name)
+        json.dump(data, stream, indent=2)
+        stream.write('\n')
+    try:
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def load(path):
+    """Read a VM descriptor and validate its supported format."""
+    with (path / 'vm.json').open() as stream:
+        value = json.load(stream)
+    check(value.get('format') == 1, 'unsupported VM descriptor')
+    return value
+
+
+def lock(path):
+    """Acquire a nonblocking per-VM lock; held for the complete emulator lifetime."""
+    stream = (path / '.lock').open('a')
+    try:
+        fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        stream.close()
+        raise Error('VM is running or being modified') from None
+    return stream
+
+
+def create(root, name, image, runner, persistent=False, if_missing=False):
+    """Register an image and trusted launcher without building or booting anything."""
+    path = vm_path(root, name)
+    image, runner = Path(image).resolve(), Path(runner).resolve()
+    check(image.is_file(), f'image not found: {image}')
+    check(runner.is_file() and os.access(runner, os.X_OK), f'executable launcher not found: {runner}')
+    descriptor = {'format': 1, 'name': name, 'image': str(image),
+                  'runner': str(runner), 'persistent': persistent}
+    root.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        check(if_missing and load(path) == descriptor,
+              f'VM {name} already exists with a different configuration; use a different name')
+        return
+    with tempfile.TemporaryDirectory(prefix='.mdev-', dir=root) as temporary:
+        stage = Path(temporary) / name
+        stage.mkdir()
+        save(stage / 'vm.json', descriptor)
+        check(not path.exists(), f'VM {name} appeared during creation')
+        stage.rename(path)
+    print(f'created VM: {name}')
+
+
+def status(path):
+    """Determine activity from the live lock, not an unsafe reusable process ID."""
+    with (path / '.lock').open('a') as stream:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return 'stopped'
+        except BlockingIOError:
+            return 'running'
+
+
+def list_vms(root):
+    """List registered VMs and their image paths without invoking a hypervisor."""
+    print('NAME\tSTATE\tDISK\tIMAGE')
+    if not root.exists():
+        return
+    for path in sorted(root.iterdir()):
+        if path.name.startswith('.') or path.is_symlink() or not (path / 'vm.json').is_file():
+            continue
+        try:
+            value = load(path)
+            mode = 'persistent' if value['persistent'] else 'fresh each boot'
+            print(f"{path.name}\t{status(path)}\t{mode}\t{value['image']}")
+        except (Error, OSError, ValueError, KeyError) as error:
+            print(f'{path.name}\tinvalid\t-\t{error}')
+
+
+def run_vm(root, name):
+    """Prepare a private disk and launch the configured backend in the foreground."""
+    path = vm_path(root, name)
+    with lock(path):
+        value = load(path)
+        source = Path(value['image'])
+        check(source.is_file(), f'image not found: {source}')
+        runtime = path / 'runtime'
+        runtime.mkdir(exist_ok=True)
+        check(not runtime.is_symlink(), 'runtime directory must not be a symlink')
+        disk = runtime / 'disk.img'
+        fingerprint = runtime / 'image.sha256'
+        # This is VM state, not an SDK or source revision pin.
+        with source.open('rb') as stream:
+            image_hash = hashlib.file_digest(stream, 'sha256').hexdigest()
+        if value['persistent'] and disk.exists():
+            check(fingerprint.is_file() and fingerprint.read_text().strip() == image_hash,
+                  'base image changed; persistent disk retained. Create a new VM to use the new image')
+        else:
+            fd, temporary = tempfile.mkstemp(prefix='.disk-', dir=runtime)
+            os.close(fd)
+            try:
+                # Independent writable copy; reflinks preserve fast local preparation.
+                subprocess.run(['cp', '--reflink=auto', '--sparse=always', '--', str(source), temporary], check=True)
+                with open(temporary, 'rb') as stream:
+                    check(hashlib.file_digest(stream, 'sha256').hexdigest() == image_hash,
+                          'source image changed while preparing VM; retry after the build finishes')
+                os.replace(temporary, disk)
+                fingerprint.write_text(image_hash + '\n')
+            finally:
+                Path(temporary).unlink(missing_ok=True)
+        env = os.environ.copy()
+        env.update(MDEV_RUNTIME_DIR=str(runtime), MDEV_IMAGE=str(disk))
+        print(f"starting {name}: {'persistent disk' if value['persistent'] else 'fresh private disk; guest changes reset on next boot'}", flush=True)
+        process = subprocess.Popen([value['runner']], env=env, start_new_session=True)
+        previous = {}
+        def forward(number, frame):
+            try:
+                os.killpg(process.pid, number)
+            except ProcessLookupError:
+                pass
+        try:
+            for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                previous[number] = signal.signal(number, forward)
+            result = process.wait()
+        finally:
+            # A launcher must not leave emulator descendants running after it exits.
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            for number, handler in previous.items():
+                signal.signal(number, handler)
+        return result if result >= 0 else 128 - result
+
+
+def remove(root, name, confirmed):
+    """Delete one stopped VM's owned disk, firmware variables, logs and descriptor."""
+    check(confirmed, 'removing VM data requires --yes')
+    path = vm_path(root, name)
+    load(path)
+    with lock(path):
+        shutil.rmtree(path)
+    print(f'removed VM: {name}')
+
+
+def main(argv=None):
+    """Run the Linux VM-management CLI with concise lifecycle errors."""
+    parser = argparse.ArgumentParser(description='Local VM environment manager (Linux)')
+    parser.add_argument('--directory', default='out/develop', help='VM store (default: out/develop)')
+    commands = parser.add_subparsers(dest='command', required=True)
+    cmd = commands.add_parser('create', help='register an image and executable launcher')
+    cmd.add_argument('name')
+    cmd.add_argument('--image', required=True)
+    cmd.add_argument('--runner', required=True)
+    cmd.add_argument('--persistent', action='store_true')
+    cmd.add_argument('--if-missing', action='store_true')
+    commands.add_parser('list', help='list VM environments and activity')
+    cmd = commands.add_parser('run', help='launch a registered VM')
+    cmd.add_argument('name')
+    cmd = commands.add_parser('remove', help='delete a stopped VM and its state')
+    cmd.add_argument('name')
+    cmd.add_argument('--yes', action='store_true')
+    args = parser.parse_args(argv)
+    root = Path(args.directory).resolve()
+    try:
+        if args.command == 'create':
+            create(root, args.name, args.image, args.runner, args.persistent, args.if_missing)
+        elif args.command == 'list':
+            list_vms(root)
+        elif args.command == 'run':
+            return run_vm(root, args.name)
+        elif args.command == 'remove':
+            remove(root, args.name, args.yes)
+        return 0
+    except (Error, OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
+        print(f'mdev: {error}', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
